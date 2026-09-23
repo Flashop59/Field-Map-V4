@@ -1,0 +1,1933 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Field Rotavation Trajectory Simulator - Obstacle Avoidance</title>
+  <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCR_UodNyR_LAC6vS2P5EdULEkNX8gwAfU"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js"></script>
+  <script>
+  /* ---------------------------------------------------------------------
+     Compatibility shim: implements the small subset of the Mapbox GL JS
+     API used below (mapboxgl.Map / mapboxgl.Marker / addSource / addLayer
+     / getSource().setData / map.on('click'|'load') / getCenter()) on top
+     of the Google Maps JavaScript API. This lets all the trajectory /
+     row-generation code below run unchanged against Google Maps.
+     ------------------------------------------------------------------- */
+  window.mapboxgl = (function () {
+    function toLatLng(lngLat) {
+      if (Array.isArray(lngLat)) return { lat: lngLat[1], lng: lngLat[0] };
+      return { lat: lngLat.lat, lng: lngLat.lng };
+    }
+
+    class HTMLOverlay extends google.maps.OverlayView {
+      constructor(gmap, element, position, draggable, onDrag, onDragEnd) {
+        super();
+        this.element = element;
+        this.position = position;
+        this.draggable = draggable;
+        this.onDrag = onDrag;
+        this.onDragEnd = onDragEnd;
+        this.element.style.position = 'absolute';
+        const prevTransform = this.element.style.transform || '';
+        this.element.style.transform = prevTransform + ' translate(-50%, -50%)';
+        this.setMap(gmap);
+        if (draggable) this._bindDrag();
+      }
+      onAdd() { this.getPanes().overlayMouseTarget.appendChild(this.element); }
+      draw() {
+        const proj = this.getProjection();
+        if (!proj) return;
+        const pos = proj.fromLatLngToDivPixel(new google.maps.LatLng(this.position.lat, this.position.lng));
+        if (pos) { this.element.style.left = pos.x + 'px'; this.element.style.top = pos.y + 'px'; }
+      }
+      onRemove() { if (this.element.parentNode) this.element.parentNode.removeChild(this.element); }
+      setPosition(lngLat) { this.position = toLatLng(lngLat); this.draw(); }
+      setMap(gmap) { this._map = gmap; super.setMap(gmap); }
+      _bindDrag() {
+        const el = this.element;
+        let dragging = false;
+        const onDown = (ev) => {
+          ev.stopPropagation(); ev.preventDefault();
+          dragging = true;
+          this._map.setOptions({ draggable: false });
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+          document.addEventListener('touchmove', onMove, { passive: false });
+          document.addEventListener('touchend', onUp);
+        };
+        const onMove = (ev) => {
+          if (!dragging) return;
+          if (ev.preventDefault) ev.preventDefault();
+          const proj = this.getProjection();
+          if (!proj) return;
+          const rect = this._map.getDiv().getBoundingClientRect();
+          const clientX = ev.touches ? ev.touches[0].clientX : ev.clientX;
+          const clientY = ev.touches ? ev.touches[0].clientY : ev.clientY;
+          const latLng = proj.fromDivPixelToLatLng(new google.maps.Point(clientX - rect.left, clientY - rect.top));
+          if (!latLng) return;
+          this.position = { lat: latLng.lat(), lng: latLng.lng() };
+          this.draw();
+          if (this.onDrag) this.onDrag(this.position);
+        };
+        const onUp = () => {
+          if (!dragging) return;
+          dragging = false;
+          this._map.setOptions({ draggable: true });
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+          document.removeEventListener('touchmove', onMove);
+          document.removeEventListener('touchend', onUp);
+          if (this.onDragEnd) this.onDragEnd(this.position);
+        };
+        el.addEventListener('mousedown', onDown);
+        el.addEventListener('touchstart', onDown, { passive: false });
+      }
+    }
+
+    class Marker {
+      constructor(optsOrEl) {
+        const opts = (optsOrEl instanceof HTMLElement) ? { element: optsOrEl } : (optsOrEl || {});
+        this.element = opts.element || document.createElement('div');
+        this.draggable = !!opts.draggable;
+        this._lngLat = { lng: 0, lat: 0 };
+        this._listeners = {};
+        this._overlay = null;
+      }
+      setLngLat(lngLat) {
+        this._lngLat = toLatLng(lngLat);
+        if (this._overlay) this._overlay.setPosition(this._lngLat);
+        return this;
+      }
+      getLngLat() {
+        const ll = this._lngLat;
+        return { lng: ll.lng, lat: ll.lat, toArray: () => [ll.lng, ll.lat] };
+      }
+      getElement() { return this.element; }
+      setRotation(deg) {
+        this.element.style.transform = `translate(-50%,-50%) rotate(${deg}deg)`;
+        return this;
+      }
+      addTo(map) {
+        this._overlay = new HTMLOverlay(map.__gmap, this.element, this._lngLat, this.draggable,
+          (pos) => { this._lngLat = pos; (this._listeners['drag'] || []).forEach(cb => cb()); },
+          (pos) => { this._lngLat = pos; (this._listeners['dragend'] || []).forEach(cb => cb()); }
+        );
+        return this;
+      }
+      on(evt, cb) { (this._listeners[evt] = this._listeners[evt] || []).push(cb); return this; }
+      remove() { if (this._overlay) this._overlay.setMap(null); return this; }
+    }
+
+    function lineOptions(paint) {
+      paint = paint || {};
+      const o = {
+        strokeColor: paint['line-color'] || '#000000',
+        strokeWeight: paint['line-width'] || 2,
+        strokeOpacity: paint['line-opacity'] != null ? paint['line-opacity'] : 1,
+        clickable: false, zIndex: 5
+      };
+      if (paint['line-dasharray']) {
+        o.strokeOpacity = 0;
+        o.icons = [{ icon: { path: 'M 0,-1 0,1', strokeOpacity: paint['line-opacity'] != null ? paint['line-opacity'] : 1, strokeColor: o.strokeColor, scale: Math.max(2, o.strokeWeight) }, offset: '0', repeat: '14px' }];
+      }
+      return o;
+    }
+    function fillOptions(paint) {
+      paint = paint || {};
+      return {
+        fillColor: paint['fill-color'] || '#000000',
+        fillOpacity: paint['fill-opacity'] != null ? paint['fill-opacity'] : 0.3,
+        strokeOpacity: 0, clickable: false, zIndex: 2
+      };
+    }
+
+    class Map {
+      constructor(opts) {
+        this.__gmap = new google.maps.Map(document.getElementById(opts.container), {
+          center: { lat: opts.center[1], lng: opts.center[0] },
+          zoom: opts.zoom || 16,
+          mapTypeId: 'hybrid',
+          tilt: 0,
+          streetViewControl: false,
+          mapTypeControl: false,
+          fullscreenControl: true,
+          zoomControl: true,
+          clickableIcons: false
+        });
+        this.sources = {};
+        this.layers = {};
+        this.overlays = {};
+        this._loadFired = false;
+        this._loadCbs = [];
+        google.maps.event.addListenerOnce(this.__gmap, 'tilesloaded', () => this._fireLoad());
+      }
+      _fireLoad() { if (this._loadFired) return; this._loadFired = true; this._loadCbs.forEach(cb => cb()); }
+      on(evt, cb) {
+        if (evt === 'load') { if (this._loadFired) cb(); else this._loadCbs.push(cb); return; }
+        if (evt === 'click') { this.__gmap.addListener('click', e => { if (e.latLng) cb({ lngLat: { lng: e.latLng.lng(), lat: e.latLng.lat() } }); }); return; }
+      }
+      addControl() { /* Google Maps already provides zoom / fullscreen controls */ }
+      addSource(id, def) { this.sources[id] = def.data || { type: 'FeatureCollection', features: [] }; }
+      getSource(id) {
+        const self = this;
+        return { setData: (data) => { self.sources[id] = data; self._render(id); } };
+      }
+      addLayer(layer) { this.layers[layer.id] = layer; this.overlays[layer.id] = []; this._render(layer.id); }
+      _render(id) {
+        const layer = this.layers[id];
+        if (!layer) return;
+        (this.overlays[id] || []).forEach(o => o.setMap(null));
+        const out = [];
+        const data = this.sources[layer.source] || { features: [] };
+        (data.features || []).forEach(f => {
+          if (!f.geometry) return;
+          if (layer.type === 'line' && f.geometry.type === 'LineString') {
+            const path = f.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }));
+            out.push(new google.maps.Polyline(Object.assign({ path, map: this.__gmap }, lineOptions(layer.paint))));
+          } else if (layer.type === 'fill' && f.geometry.type === 'Polygon') {
+            const path = f.geometry.coordinates[0].map(c => ({ lat: c[1], lng: c[0] }));
+            out.push(new google.maps.Polygon(Object.assign({ paths: path, map: this.__gmap }, fillOptions(layer.paint))));
+          } else if (layer.type === 'symbol' && f.geometry.type === 'Point') {
+            const el = document.createElement('div');
+            el.textContent = (f.properties && f.properties.label) || '';
+            el.style.cssText = 'color:#e6edf3;font:11px sans-serif;font-weight:600;text-shadow:-1px -1px 0 #0d1117,1px -1px 0 #0d1117,-1px 1px 0 #0d1117,1px 1px 0 #0d1117;white-space:nowrap;pointer-events:none;';
+            out.push(new HTMLOverlay(this.__gmap, el, { lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] }, false));
+          }
+        });
+        this.overlays[id] = out;
+      }
+      getCenter() {
+        const c = this.__gmap.getCenter();
+        return { lng: c.lng(), lat: c.lat(), toArray: () => [c.lng(), c.lat()] };
+      }
+    }
+
+    class NavigationControl {}
+    class FullscreenControl {}
+
+    return { Map, Marker, NavigationControl, FullscreenControl, accessToken: null };
+  })();
+  </script>
+  <style>
+    :root { --bg:#0d1117; --panel:#151b23; --muted:#8b949e; --text:#e6edf3; --line:#30363d; --accent:#2f81f7; --good:#3fb950; --warn:#d29922; --bad:#f85149; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Inter, Segoe UI, Roboto, Arial, sans-serif; background:var(--bg); color:var(--text); }
+    #app { display:grid; grid-template-columns: 385px 1fr; height:100vh; }
+    #sidebar { background:var(--panel); border-right:1px solid var(--line); padding:16px; overflow:auto; }
+    #map { width:100%; height:100%; }
+    h1 { font-size:18px; margin:0 0 8px; }
+    h2 { font-size:13px; margin:18px 0 8px; color:#c9d1d9; text-transform:uppercase; letter-spacing:.05em; }
+    p { color:var(--muted); font-size:13px; line-height:1.45; }
+    label { display:block; margin:10px 0 5px; font-size:13px; color:#c9d1d9; }
+    input, select, button { width:100%; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:#0d1117; color:var(--text); font-size:13px; }
+    input[type="checkbox"] { width:auto; transform: translateY(1px); }
+    button { cursor:pointer; background:#21262d; font-weight:600; }
+    button.primary { background:var(--accent); border-color:var(--accent); color:white; }
+    button.good { background:#238636; border-color:#238636; color:white; }
+    button.warn { background:#9e6a03; border-color:#9e6a03; color:white; }
+    button.bad { background:#da3633; border-color:#da3633; color:white; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+    .small { font-size:12px; color:var(--muted); }
+    .status { padding:10px; border:1px solid var(--line); border-radius:10px; background:#0d1117; margin-top:10px; font-size:12px; line-height:1.45; }
+    .pill { display:inline-block; padding:2px 7px; border:1px solid var(--line); border-radius:999px; color:#c9d1d9; margin:2px 2px 2px 0; }
+    .edgeList, .vertexList { display:grid; gap:6px; margin-top:6px; }
+    .edgeBtn, .vertexBtn { text-align:left; font-weight:500; }
+    .active { outline:2px solid var(--accent); }
+    .legend { display:grid; gap:6px; margin-top:8px; font-size:12px; color:#c9d1d9; }
+    .swatch { width:22px; height:4px; display:inline-block; vertical-align:middle; margin-right:8px; border-radius:8px; }
+    .help { background:#0d1117; border:1px solid var(--line); border-radius:10px; padding:10px; margin-top:10px; }
+    .chkline { display:flex; align-items:center; gap:8px; margin-top:9px; color:#c9d1d9; font-size:13px; }
+    .simBox { border:1px solid var(--line); border-radius:10px; background:#0d1117; padding:10px; margin-top:12px; }
+    .simControls { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin-top:8px; }
+    .machineMarker { width:34px; height:34px; border-radius:50%; background:#f0883e; border:3px solid #fff; box-shadow:0 0 0 3px rgba(240,136,62,.25); display:flex; align-items:center; justify-content:center; transform-origin:center; }
+    .machineMarker:after { content:''; width:0; height:0; border-left:7px solid transparent; border-right:7px solid transparent; border-bottom:15px solid #0d1117; transform:translateY(-2px); }
+    .obstacleHandle { width:22px; height:22px; border-radius:50%; background:#db2f83; border:3px solid #fff; box-shadow:0 0 0 3px rgba(219,47,131,.25); cursor:grab; }
+    .obstacleHandle.square { border-radius:5px; }
+    .obstacleHandle.selected { outline:3px solid #ffa7d1; }
+    .obstacleList { display:grid; gap:6px; margin-top:8px; }
+    .obstacleItem { display:grid; grid-template-columns:1fr auto; gap:6px; align-items:center; border:1px solid var(--line); border-radius:8px; padding:7px; background:#0d1117; font-size:12px; }
+    .obstacleItem button { padding:5px 8px; }
+    @media (max-width: 900px) { #app { grid-template-columns:1fr; grid-template-rows: 54vh 46vh; } #sidebar { grid-row:2; border-right:0; border-top:1px solid var(--line); } #map { grid-row:1; } }
+  </style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <h1>Rotavation Trajectory Simulator</h1>
+    <p>Click on the map to mark field vertices. Then close polygon, select base edge and start vertex. Rows are generated inside a field-safe centerline polygon. Optional dark-pink obstacle zones are treated like internal field boundaries, and obstacle-split rows return on the same path. Connectors are routed through the safe headland/perimeter instead of cutting diagonally around wells.</p>
+
+    <div class="row">
+      <button id="btnDraw" class="primary">Draw / Add vertices</button>
+      <button id="btnClose">Close polygon</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnUndo">Undo vertex</button>
+      <button id="btnReset" class="bad">Reset all</button>
+    </div>
+
+    <h2>Field parameters</h2>
+    <div class="row">
+      <div>
+        <label>R2R row distance (m)</label>
+        <input id="r2r" type="number" min="0.1" step="0.1" value="2.0" />
+      </div>
+      <div>
+        <label>Turn-side offset / headland (m)</label>
+        <input id="offset" type="number" min="0" step="0.1" value="3.0" />
+        <div class="small">Minimum enforced: R2R × clearance factor.</div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Minimum turn jump (rows)</label>
+        <input id="jump" type="number" min="1" step="1" value="3" />
+      </div>
+      <div>
+        <label>Row extension for turn (m)</label>
+        <input id="turnExt" type="number" min="0" step="0.5" value="2.0" />
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Boundary clearance factor</label>
+        <input id="sideClearanceFactor" type="number" min="0.50" step="0.01" value="0.55" />
+        <div class="small">Machine center stays R2R × factor away from physical field boundary. Default 0.55 is slightly greater than R2R/2.</div>
+      </div>
+      <div>
+        <label>Max rows safety cap</label>
+        <input id="maxRows" type="number" min="50" step="50" value="1200" />
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Label every Nth row</label>
+        <input id="labelEvery" type="number" min="1" step="1" value="5" />
+      </div>
+      <div></div>
+    </div>
+    <label>Trajectory sequence logic</label>
+    <select id="logic">
+      <option value="custom146" selected>Custom skip pattern: 1 → 4 → 2 → 6 → 3 → 8 → 5 → 10 → 7</option>
+      <option value="greedy">Greedy skip pattern - prefer larger turning radius</option>
+      <option value="adjacent">Adjacent rows only</option>
+    </select>
+    <div class="chkline"><input id="showHeadland" type="checkbox" checked /> <span>After main rows, rotavate turn-side offset strips</span></div>
+    <div class="chkline"><input id="showMarkers" type="checkbox" checked /> <span>Show row number labels</span></div>
+
+    <h2>Obstacles / wells</h2>
+    <p>Optional: add a square or circular obstacle, then drag its pink handle over the well/object. The hashed dark-pink avoidance zone is treated like an internal red boundary. If it cuts a row, the machine goes up to the obstacle boundary and returns on the same path; it will not do a same-row side bypass around the object.</p>
+    <div class="row">
+      <div>
+        <label>Obstacle shape</label>
+        <select id="obstacleShape">
+          <option value="circle" selected>Circle</option>
+          <option value="square">Square</option>
+        </select>
+      </div>
+      <div>
+        <label>Obstacle size (m)</label>
+        <input id="obstacleSize" type="number" min="0.5" step="0.5" value="5.0" />
+        <div class="small">Circle = diameter, square = side length.</div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnAddObstacle" class="warn">Add obstacle at map center</button>
+      <button id="btnClearObstacles" class="bad">Clear obstacles</button>
+    </div>
+    <div class="small" style="margin-top:6px">Obstacle safety margin uses the same clearance: R2R × boundary clearance factor. The pink outer line is the no-go boundary for the machine centerline.</div>
+    <div id="obstacleList" class="obstacleList small">No obstacles added.</div>
+
+    <h2>Select base edge</h2>
+    <div id="edgeList" class="edgeList small">Close polygon first.</div>
+
+    <h2>Select start vertex</h2>
+    <div id="vertexList" class="vertexList small">Select one of the two vertices of the base edge.</div>
+
+    <button id="btnGenerate" class="good" style="margin-top:14px">Generate trajectory</button>
+    <button id="btnExport" style="margin-top:8px">Export GeoJSON</button>
+
+    <h2>Machine simulation</h2>
+    <div class="simBox">
+      <div class="row">
+        <div>
+          <label>Machine speed (m/s)</label>
+          <input id="machineSpeed" type="number" min="0.1" step="0.1" value="1.0" />
+        </div>
+        <div>
+          <label>Playback speed</label>
+          <select id="playbackSpeed">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+            <option value="8">8x</option>
+          </select>
+        </div>
+      </div>
+      <div class="simControls">
+        <button id="btnPlay" class="primary">Play</button>
+        <button id="btnPause">Pause</button>
+        <button id="btnStop" class="warn">Stop</button>
+      </div>
+      <label>Progress</label>
+      <input id="simProgress" type="range" min="0" max="1000" step="1" value="0" />
+      <div id="simInfo" class="small">Generate trajectory first, then press Play.</div>
+    </div>
+
+    <div class="status" id="status">Ready. Add at least 3 vertices.</div>
+
+    <div class="help">
+      <div class="legend"><span><i class="swatch" style="background:#f85149"></i>Outer field boundary</span><span><i class="swatch" style="background:#d29922"></i>Turn-side inner offset / R2R side-clearance guide</span><span><i class="swatch" style="background:#58a6ff"></i>Working rows</span><span><i class="swatch" style="background:#3fb950"></i>Turn connection path</span><span><i class="swatch" style="background:#a371f7"></i>After-operation offset strip rotavation</span><span><i class="swatch" style="background:#f0883e"></i>Simulated travelled path</span><span><i class="swatch" style="background:#db2f83"></i>Obstacle / well avoidance zone</span></div>
+    </div>
+  </aside>
+  <main id="map"></main>
+</div>
+
+<script>
+  // Google Maps API key is supplied via the <script src="...maps.googleapis.com..."> tag in <head>.
+
+  const state = {
+    drawing: true,
+    closed: false,
+    vertices: [],
+    selectedEdge: null,
+    selectedStartVertex: null,
+    markers: [],
+    labelFeatures: [],
+    obstacles: [],
+    selectedObstacleId: null,
+    nextObstacleId: 1,
+    genTimer: null,
+    mapReady: false,
+    lastGeojson: null,
+    sim: {
+      marker: null,
+      raf: null,
+      playing: false,
+      lastTs: null,
+      distance: 0,
+      totalDistance: 0,
+      path: [],
+      cum: []
+    }
+  };
+
+  const map = new mapboxgl.Map({
+    container: 'map',
+    center: [74.65, 19.38],
+    zoom: 16
+  });
+  map.addControl(new mapboxgl.NavigationControl(), 'top-right');
+  map.addControl(new mapboxgl.FullscreenControl(), 'top-right');
+
+  const $ = id => document.getElementById(id);
+
+  map.on('load', () => {
+    addSourceLayer('field-outline', { type:'FeatureCollection', features:[] }, 'line', { 'line-color':'#f85149', 'line-width':3 });
+    addSourceLayer('field-fill', { type:'FeatureCollection', features:[] }, 'fill', { 'fill-color':'#f85149', 'fill-opacity':0.12 });
+    addSourceLayer('obstacle-fill', { type:'FeatureCollection', features:[] }, 'fill', { 'fill-color':'#db2f83', 'fill-opacity':0.32 });
+    addSourceLayer('obstacle-outline', { type:'FeatureCollection', features:[] }, 'line', { 'line-color':'#ff7ab8', 'line-width':3 });
+    addSourceLayer('obstacle-hatch', { type:'FeatureCollection', features:[] }, 'line', { 'line-color':'#ffd1e6', 'line-width':1.5, 'line-opacity':0.9 });
+    addSourceLayer('offset-outline', { type:'FeatureCollection', features:[] }, 'line', { 'line-color':'#d29922', 'line-width':3, 'line-dasharray':[2,1] });
+    addSourceLayer('offset-fill', { type:'FeatureCollection', features:[] }, 'fill', { 'fill-color':'#d29922', 'fill-opacity':0.09 });
+    addSourceLayer('row-lines', { type:'FeatureCollection', features:[] }, 'line', { 'line-color':'#58a6ff', 'line-width':4 });
+    addSourceLayer('turn-lines', { type:'FeatureCollection', features:[] }, 'line', { 'line-color':'#3fb950', 'line-width':3 });
+    addSourceLayer('headland-lines', { type:'FeatureCollection', features:[] }, 'line', { 'line-color':'#a371f7', 'line-width':3, 'line-dasharray':[1,1] });
+    addSourceLayer('sim-travelled', { type:'FeatureCollection', features:[] }, 'line', { 'line-color':'#f0883e', 'line-width':5, 'line-opacity':0.9 });
+    map.addSource('row-labels', { type:'geojson', data:{ type:'FeatureCollection', features:[] } });
+    map.addLayer({
+      id:'row-labels',
+      type:'symbol',
+      source:'row-labels',
+      layout:{ 'text-field':['get','label'], 'text-size':11, 'text-allow-overlap':false, 'text-ignore-placement':false },
+      paint:{ 'text-color':'#e6edf3', 'text-halo-color':'#0d1117', 'text-halo-width':1.5 }
+    });
+    state.mapReady = true;
+  });
+
+  function addSourceLayer(id, data, type, paint) {
+    map.addSource(id, { type:'geojson', data });
+    map.addLayer({ id, type, source:id, paint });
+  }
+
+  map.on('click', e => {
+    if (!state.drawing || state.closed) return;
+    state.vertices.push([e.lngLat.lng, e.lngLat.lat]);
+    updateAll();
+  });
+
+  $('btnDraw').onclick = () => { state.drawing = true; setStatus('Drawing mode ON. Click map to add vertices.'); };
+  $('btnClose').onclick = () => {
+    if (state.vertices.length < 3) return setStatus('Need at least 3 vertices to close polygon.');
+    state.closed = true; state.drawing = false; state.selectedEdge = null; state.selectedStartVertex = null; updateAll(); setStatus('Polygon closed. Now select base edge and start vertex.');
+  };
+  $('btnUndo').onclick = () => { if (!state.closed) { state.vertices.pop(); updateAll(); } };
+  $('btnReset').onclick = resetAll;
+  $('btnGenerate').onclick = generateTrajectory;
+  $('btnExport').onclick = exportGeojson;
+  $('btnAddObstacle').onclick = addObstacleAtMapCenter;
+  $('btnClearObstacles').onclick = clearObstacles;
+  $('btnPlay').onclick = startSimulation;
+  $('btnPause').onclick = pauseSimulation;
+  $('btnStop').onclick = stopSimulation;
+  $('simProgress').addEventListener('input', onProgressInput);
+  ['machineSpeed','playbackSpeed'].forEach(id => $(id).addEventListener('change', updateSimInfo));
+  ['r2r','offset','sideClearanceFactor','jump','turnExt','maxRows','labelEvery','logic','showHeadland','showMarkers'].forEach(id => $(id).addEventListener('change', () => { updateObstacleLayers(); if (state.closed) requestGenerate(); }));
+  $('obstacleShape').addEventListener('change', () => { if (state.selectedObstacleId) updateSelectedObstacleFromInputs(); });
+  $('obstacleSize').addEventListener('change', () => { if (state.selectedObstacleId) updateSelectedObstacleFromInputs(); });
+
+  function requestGenerate() {
+    clearTimeout(state.genTimer);
+    state.genTimer = setTimeout(generateTrajectory, 250);
+  }
+
+  function resetAll() {
+    stopSimulation({keepMarker:false, clearPath:true});
+    state.drawing = true; state.closed = false; state.vertices = []; state.selectedEdge = null; state.selectedStartVertex = null; state.lastGeojson = null;
+    clearObstacles(false);
+    clearMarkers(); clearLabels(); updateLayer('field-outline', fc([])); updateLayer('field-fill', fc([])); updateLayer('obstacle-fill', fc([])); updateLayer('obstacle-outline', fc([])); updateLayer('obstacle-hatch', fc([])); updateLayer('offset-outline', fc([])); updateLayer('offset-fill', fc([])); updateLayer('row-lines', fc([])); updateLayer('turn-lines', fc([])); updateLayer('headland-lines', fc([])); updateLayer('sim-travelled', fc([]));
+    $('edgeList').innerHTML = 'Close polygon first.'; $('vertexList').innerHTML = 'Select one of the two vertices of the base edge.'; setStatus('Reset done. Add field vertices.');
+  }
+
+
+  function addObstacleAtMapCenter() {
+    if (!state.mapReady) return setStatus('Map is still loading. Try again after the map appears.');
+    const shape = $('obstacleShape').value === 'square' ? 'square' : 'circle';
+    const sizeM = Math.max(0.5, +$('obstacleSize').value || 5);
+    const center = map.getCenter().toArray();
+    const obstacle = { id: state.nextObstacleId++, type: shape, center, sizeM, marker: null };
+    state.obstacles.push(obstacle);
+    state.selectedObstacleId = obstacle.id;
+    createObstacleMarker(obstacle);
+    updateObstacleInputsFromSelected();
+    refreshObstacleList();
+    updateObstacleLayers();
+    if (state.closed) requestGenerate();
+    setStatus(`Obstacle ${obstacle.id} added. Drag the pink handle to place it over the well/object.`);
+  }
+
+  function createObstacleMarker(obstacle) {
+    if (obstacle.marker) obstacle.marker.remove();
+    const el = document.createElement('div');
+    el.className = 'obstacleHandle ' + (obstacle.type === 'square' ? 'square' : 'circle') + (state.selectedObstacleId === obstacle.id ? ' selected' : '');
+    el.title = `Obstacle ${obstacle.id} - drag to move`;
+    el.onclick = (ev) => { ev.stopPropagation(); selectObstacle(obstacle.id); };
+    const marker = new mapboxgl.Marker({element:el, draggable:true}).setLngLat(obstacle.center).addTo(map);
+    marker.on('drag', () => {
+      obstacle.center = marker.getLngLat().toArray();
+      updateObstacleLayers();
+    });
+    marker.on('dragend', () => {
+      obstacle.center = marker.getLngLat().toArray();
+      updateObstacleLayers();
+      refreshObstacleList();
+      if (state.closed) requestGenerate();
+    });
+    obstacle.marker = marker;
+  }
+
+  function selectObstacle(id) {
+    state.selectedObstacleId = id;
+    updateObstacleInputsFromSelected();
+    refreshObstacleList();
+    state.obstacles.forEach(o => {
+      if (o.marker) o.marker.getElement().classList.toggle('selected', o.id === id);
+    });
+  }
+
+  function updateObstacleInputsFromSelected() {
+    const o = state.obstacles.find(x => x.id === state.selectedObstacleId);
+    if (!o) return;
+    $('obstacleShape').value = o.type;
+    $('obstacleSize').value = o.sizeM;
+  }
+
+  function updateSelectedObstacleFromInputs() {
+    const o = state.obstacles.find(x => x.id === state.selectedObstacleId);
+    if (!o) return;
+    o.type = $('obstacleShape').value === 'square' ? 'square' : 'circle';
+    o.sizeM = Math.max(0.5, +$('obstacleSize').value || o.sizeM || 5);
+    if (o.marker) {
+      const old = o.marker;
+      old.remove();
+      o.marker = null;
+      createObstacleMarker(o);
+    }
+    refreshObstacleList();
+    updateObstacleLayers();
+    if (state.closed) requestGenerate();
+  }
+
+  function deleteObstacle(id) {
+    const idx = state.obstacles.findIndex(o => o.id === id);
+    if (idx < 0) return;
+    if (state.obstacles[idx].marker) state.obstacles[idx].marker.remove();
+    state.obstacles.splice(idx, 1);
+    if (state.selectedObstacleId === id) state.selectedObstacleId = state.obstacles[0]?.id || null;
+    refreshObstacleList();
+    updateObstacleLayers();
+    if (state.closed) requestGenerate();
+  }
+
+  function clearObstacles(shouldRegenerate=true) {
+    state.obstacles.forEach(o => { if (o.marker) o.marker.remove(); });
+    state.obstacles = [];
+    state.selectedObstacleId = null;
+    refreshObstacleList();
+    updateObstacleLayers();
+    if (shouldRegenerate && state.closed) requestGenerate();
+  }
+
+  function refreshObstacleList() {
+    const list = $('obstacleList');
+    if (!list) return;
+    if (!state.obstacles.length) { list.textContent = 'No obstacles added.'; return; }
+    list.innerHTML = '';
+    state.obstacles.forEach(o => {
+      const item = document.createElement('div');
+      item.className = 'obstacleItem';
+      const label = document.createElement('div');
+      label.innerHTML = `<b>${o.id === state.selectedObstacleId ? '✓ ' : ''}Obstacle ${o.id}</b><br>${o.type}, ${o.sizeM.toFixed(1)} m`;
+      label.style.cursor = 'pointer';
+      label.onclick = () => selectObstacle(o.id);
+      const del = document.createElement('button');
+      del.className = 'bad';
+      del.textContent = 'Delete';
+      del.onclick = () => deleteObstacle(o.id);
+      item.appendChild(label);
+      item.appendChild(del);
+      list.appendChild(item);
+    });
+  }
+
+  function obstaclePolygon(o) {
+    if (o.type === 'square') {
+      const half = o.sizeM / 2;
+      const proj = makeProjector(o.center);
+      const pts = [
+        proj.toLL({x:-half, y:-half}),
+        proj.toLL({x: half, y:-half}),
+        proj.toLL({x: half, y: half}),
+        proj.toLL({x:-half, y: half})
+      ];
+      return poly([...pts, pts[0]], {type:'obstacle', obstacle_id:o.id, shape:o.type, size_m:o.sizeM});
+    }
+    return turf.circle(o.center, o.sizeM / 2, {steps:48, units:'meters', properties:{type:'obstacle', obstacle_id:o.id, shape:o.type, size_m:o.sizeM}});
+  }
+
+  function currentClearanceM() {
+    const r2r = Math.max(0.1, +$('r2r').value || 2);
+    const factor = Math.max(0.5, +$('sideClearanceFactor').value || 0.55);
+    return r2r * factor;
+  }
+
+  function buildObstacleAvoidanceFeatures(clearanceM=currentClearanceM()) {
+    const features = [];
+    state.obstacles.forEach(o => {
+      const raw = obstaclePolygon(o);
+      let avoid = turf.buffer(raw, Math.max(0, clearanceM), {units:'meters'});
+      if (!avoid || !avoid.geometry) return;
+      avoid.properties = {...(avoid.properties || {}), type:'obstacle_avoidance_zone', obstacle_id:o.id, shape:o.type, object_size_m:o.sizeM, clearance_m:clearanceM};
+      features.push(avoid);
+    });
+    return features;
+  }
+
+  function updateObstacleLayers(clearanceM=currentClearanceM()) {
+    if (!state.mapReady) return;
+    const features = buildObstacleAvoidanceFeatures(clearanceM);
+    updateLayer('obstacle-fill', fc(features));
+    updateLayer('obstacle-outline', fc(features));
+    const hatches = [];
+    features.forEach(f => hatches.push(...buildHatchLinesForPolygon(f, 1.6)));
+    updateLayer('obstacle-hatch', fc(hatches));
+  }
+
+  function buildHatchLinesForPolygon(feature, spacingM=1.5) {
+    const rings = polygonOuterRings(feature);
+    const out = [];
+    rings.forEach((ringLL, ringIdx) => {
+      if (!ringLL.length) return;
+      const origin = ringLL[0];
+      const proj = makeProjector(origin);
+      const angle = -45 * Math.PI/180;
+      const ca = Math.cos(angle), sa = Math.sin(angle);
+      const toRT = (ll) => {
+        const xy = proj.toXY(ll);
+        return {r: xy.x*ca - xy.y*sa, t: xy.x*sa + xy.y*ca};
+      };
+      const fromRT = (p) => {
+        const x = p.r*ca + p.t*sa;
+        const y = -p.r*sa + p.t*ca;
+        return proj.toLL({x,y});
+      };
+      const ringRT = ringLL.map(toRT);
+      const minT = Math.min(...ringRT.map(p=>p.t));
+      const maxT = Math.max(...ringRT.map(p=>p.t));
+      let guard = 0;
+      for (let t = minT - spacingM; t <= maxT + spacingM && guard++ < 500; t += spacingM) {
+        const rs = horizontalIntersectionsRT(ringRT, t).sort((a,b)=>a-b);
+        for (let k=0; k<rs.length-1; k+=2) {
+          if (rs[k+1] - rs[k] > 0.15) out.push(line([fromRT({r:rs[k], t}), fromRT({r:rs[k+1], t})], {type:'obstacle_hatch', ring:ringIdx}));
+        }
+      }
+    });
+    return out;
+  }
+
+  function horizontalIntersectionsRT(ring, t) {
+    const xs = [];
+    for (let i=0;i<ring.length;i++) {
+      const a=ring[i], b=ring[(i+1)%ring.length];
+      if ((a.t <= t && b.t > t) || (b.t <= t && a.t > t)) {
+        const f = (t-a.t)/(b.t-a.t);
+        xs.push(a.r + f*(b.r-a.r));
+      }
+    }
+    return xs;
+  }
+
+  function updateAll() {
+    clearMarkers();
+    state.vertices.forEach((p,i) => {
+      const el = document.createElement('div');
+      el.style.cssText = 'background:#2f81f7;color:white;border:2px solid white;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font:12px sans-serif;font-weight:700;';
+      el.textContent = i+1;
+      state.markers.push(new mapboxgl.Marker(el).setLngLat(p).addTo(map));
+    });
+    const lineCoords = state.closed ? [...state.vertices, state.vertices[0]] : state.vertices;
+    updateLayer('field-outline', fc(lineCoords.length > 1 ? [line(lineCoords, {name:'field_boundary'})] : []));
+    updateLayer('field-fill', state.closed ? fc([poly([...state.vertices, state.vertices[0]], {name:'field_polygon'})]) : fc([]));
+    buildEdgeList();
+  }
+
+  function buildEdgeList() {
+    if (!state.closed) return;
+    const edgeList = $('edgeList'); edgeList.innerHTML = '';
+    for (let i=0;i<state.vertices.length;i++) {
+      const j = (i+1) % state.vertices.length;
+      const len = turf.length(line([state.vertices[i], state.vertices[j]]), {units:'meters'});
+      const btn = document.createElement('button'); btn.className = 'edgeBtn' + (state.selectedEdge===i?' active':'');
+      btn.textContent = `Edge ${i+1}: V${i+1} → V${j+1} | ${len.toFixed(1)} m`;
+      btn.onclick = () => { state.selectedEdge=i; state.selectedStartVertex=i; buildEdgeList(); buildVertexList(); requestGenerate(); };
+      edgeList.appendChild(btn);
+    }
+    buildVertexList();
+  }
+
+  function buildVertexList() {
+    const box = $('vertexList'); box.innerHTML = '';
+    if (state.selectedEdge === null) { box.textContent = 'Select base edge first.'; return; }
+    const i = state.selectedEdge, j = (i+1)%state.vertices.length;
+    [i,j].forEach(v => {
+      const btn = document.createElement('button'); btn.className = 'vertexBtn' + (state.selectedStartVertex===v?' active':'');
+      btn.textContent = `Start from V${v+1}`;
+      btn.onclick = () => { state.selectedStartVertex = v; buildVertexList(); requestGenerate(); };
+      box.appendChild(btn);
+    });
+  }
+
+  function generateTrajectory() {
+    try {
+      generateTrajectoryCore();
+    } catch (err) {
+      console.error(err);
+      setStatus('Generation stopped due to an error. Please check polygon shape, offset, and R2R values.');
+    }
+  }
+
+  function generateTrajectoryCore() {
+    if (!state.mapReady) return setStatus('Map is still loading. Try again after the map appears.');
+    if (!state.closed || state.selectedEdge === null || state.selectedStartVertex === null) return setStatus('Close polygon, select base edge, and select start vertex.');
+    const r2r = Math.max(0.1, +$('r2r').value || 2);
+    const sideClearanceFactor = Math.max(0.5, +$('sideClearanceFactor').value || 0.55);
+    const sideClearanceM = r2r * sideClearanceFactor;
+    const requestedOffsetM = Math.max(0, +$('offset').value || 0);
+    const offsetM = Math.max(requestedOffsetM, sideClearanceM);
+    const jump = Math.max(1, Math.floor(+$('jump').value || 3));
+    const turnExt = Math.max(0, +$('turnExt').value || 0);
+    const maxRows = Math.max(50, Math.floor(+$('maxRows').value || 1200));
+    const labelEvery = Math.max(1, Math.floor(+$('labelEvery').value || 5));
+
+    stopSimulation({keepMarker:false, clearPath:true});
+
+    const outerPoly = poly([...state.vertices, state.vertices[0]], {name:'outer_field'});
+    const obstacleAvoidanceFeatures = buildObstacleAvoidanceFeatures(sideClearanceM);
+    updateObstacleLayers(sideClearanceM);
+
+    // Build local row coordinate system.
+    // s-axis = machine row direction. t-axis = row-to-row spacing direction.
+    // Turn headland offset is applied on s-min and s-max turning sides.
+    // A separate automatic side clearance of R2R*factor is applied on t-min and t-max so row centre-lines never run on physical boundaries.
+    const baseA = state.vertices[state.selectedEdge];
+    const baseB = state.vertices[(state.selectedEdge+1)%state.vertices.length];
+    const origin = state.vertices[state.selectedStartVertex];
+    const proj = makeProjector(origin);
+    let A = proj.toXY(baseA), B = proj.toXY(baseB);
+    if (state.selectedStartVertex === (state.selectedEdge+1)%state.vertices.length) { const tmp=A; A=B; B=tmp; }
+    const dx = B.x-A.x, dy = B.y-A.y, L = Math.hypot(dx,dy) || 1;
+    const u = {x:dx/L, y:dy/L};
+    const n1 = {x:-u.y, y:u.x};
+    const n2 = {x:u.y, y:-u.x};
+    let normal = n1;
+    const testT = averageST(state.vertices.map(ll => xyToST(proj.toXY(ll), proj.toXY(origin), u, n1))).t;
+    if (testT < 0) normal = n2;
+
+    const outerST = state.vertices.map(ll => xyToST(proj.toXY(ll), proj.toXY(origin), u, normal));
+    const minSOuter = Math.min(...outerST.map(p=>p.s));
+    const maxSOuter = Math.max(...outerST.map(p=>p.s));
+
+    // Important correction:
+    // Earlier logic used only global min/max T clearance. On stepped or angled field boundaries,
+    // that can still leave parts of rows/turns outside the actual polygon.
+    // Now all machine centre-lines are generated inside an inward-buffered safe polygon.
+    const safePolyRaw = turf.buffer(outerPoly, -sideClearanceM, {units:'meters'});
+    const safePoly = safePolyRaw ? largestPolygon(safePolyRaw) : null;
+    if (!safePoly || !safePoly.geometry || turf.area(safePoly) < 1) {
+      updateLayer('offset-outline', fc([])); updateLayer('offset-fill', fc([])); updateLayer('row-lines', fc([])); updateLayer('turn-lines', fc([])); updateLayer('headland-lines', fc([])); clearLabels();
+      return setStatus(`Field is too narrow after boundary clearance. Clearance is ${sideClearanceM.toFixed(2)} m. Reduce R2R/clearance factor or check the polygon.`);
+    }
+
+    const safeRingLL = safePoly.geometry.coordinates[0].slice(0, -1);
+    const safeRingST = cleanRingST(safeRingLL.map(ll => xyToST(proj.toXY(ll), proj.toXY(origin), u, normal)));
+    const obstacleRingsST = [];
+    obstacleAvoidanceFeatures.forEach(f => {
+      polygonOuterRings(f).forEach(ringLL => {
+        const ringST = cleanRingST(ringLL.map(ll => xyToST(proj.toXY(ll), proj.toXY(origin), u, normal)));
+        if (ringST.length >= 3 && Math.abs(signedAreaST(ringST)) > 0.1) obstacleRingsST.push(ringST);
+      });
+    });
+    const minSSafe = Math.min(...safeRingST.map(p=>p.s));
+    const maxSSafe = Math.max(...safeRingST.map(p=>p.s));
+
+    const usableLength = maxSOuter - minSOuter - (2 * offsetM);
+    if (usableLength <= 0.5) {
+      updateLayer('offset-outline', fc([])); updateLayer('offset-fill', fc([safePoly])); updateLayer('row-lines', fc([])); updateLayer('turn-lines', fc([])); updateLayer('headland-lines', fc([])); clearLabels();
+      return setStatus('Turn-side offset is too large for this field length. Reduce offset/headland value.');
+    }
+
+    const sMinWork = minSOuter + offsetM;
+    const sMaxWork = maxSOuter - offsetM;
+    let workRingST = clipPolygonBySRange(safeRingST, sMinWork, sMaxWork);
+    if (!workRingST || workRingST.length < 3 || Math.abs(signedAreaST(workRingST)) < 0.5) {
+      updateLayer('offset-outline', fc([])); updateLayer('offset-fill', fc([safePoly])); updateLayer('row-lines', fc([])); updateLayer('turn-lines', fc([])); updateLayer('headland-lines', fc([])); clearLabels();
+      return setStatus('Could not create a field-safe work area. Try reducing offset/R2R or check polygon shape.');
+    }
+
+    const workRingLL = workRingST.map(st => stToLngLat(st, proj, origin, u, normal));
+    const workPoly = poly([...workRingLL, workRingLL[0]], {name:'field_safe_main_work_area', offset_mode:'turn_side_plus_boundary_clearance'});
+    const safeBoundaryLine = line([...safeRingLL, safeRingLL[0]], {type:'field_safe_centerline_boundary', clearance_m:sideClearanceM});
+    let offsetGuideFeatures = [
+      safeBoundaryLine,
+      ...buildConstantSLines(safeRingST, sMinWork, proj, origin, u, normal, {type:'inner_offset_line', side:'start_turn_side'}),
+      ...buildConstantSLines(safeRingST, sMaxWork, proj, origin, u, normal, {type:'inner_offset_line', side:'end_turn_side'})
+    ];
+
+    const stRing = workRingST;
+    let minT = Math.min(...stRing.map(p=>p.t)), maxT = Math.max(...stRing.map(p=>p.t));
+    const safeMinT = minT;
+    const safeMaxT = maxT;
+    if (safeMaxT - safeMinT < 0.5) {
+      updateLayer('offset-outline', fc(offsetGuideFeatures)); updateLayer('offset-fill', fc([safePoly])); updateLayer('row-lines', fc([])); updateLayer('turn-lines', fc([])); updateLayer('headland-lines', fc([])); clearLabels();
+      return setStatus(`Field is too narrow after automatic boundary clearance. Clearance is ${sideClearanceM.toFixed(2)} m. Reduce R2R/clearance factor or check selected base edge.`);
+    }
+
+    // Show safe centre-line boundary and turn-side offset lines.
+    updateLayer('offset-outline', fc(offsetGuideFeatures));
+    updateLayer('offset-fill', fc([safePoly]));
+
+    const estimatedRows = Math.floor((safeMaxT - safeMinT) / r2r) + 2;
+    if (estimatedRows > maxRows) {
+      updateLayer('row-lines', fc([])); updateLayer('turn-lines', fc([])); updateLayer('headland-lines', fc([])); clearLabels();
+      return setStatus(`Too many rows estimated (${estimatedRows}). Increase R2R or increase Max rows safety cap. This protection prevents browser freeze.`);
+    }
+    const rowTs = [];
+    for (let t = safeMinT; t <= safeMaxT + 0.001; t += r2r) rowTs.push(t);
+    if (rowTs.length && safeMaxT - rowTs[rowTs.length-1] > r2r * 0.35) rowTs.push(safeMaxT);
+    if (!rowTs.length) rowTs.push((safeMinT + safeMaxT) / 2);
+
+    const rowGroups = [];
+    let rowSegmentCount = 0;
+    rowTs.forEach((t, rowIdx) => {
+      const fieldIntervals = intervalsFromIntersections(horizontalIntersections(stRing, t));
+      const blockedIntervals = [];
+      obstacleRingsST.forEach(obsRing => blockedIntervals.push(...intervalsFromIntersections(horizontalIntersections(obsRing, t))));
+
+      // Obstacle correction:
+      // The dark-pink inflated obstacle zone is treated like an internal field boundary.
+      // We subtract that whole zone from each row. If a row is split by an obstacle,
+      // the segment becomes a dead-end pass: the machine goes up to the obstacle
+      // clearance boundary and returns back on the same path instead of bypassing
+      // around the object and continuing on the same row.
+      const freeIntervals = subtractIntervals(fieldIntervals, blockedIntervals, 0.02);
+      const segments = freeIntervals
+        .filter(([s0, s1]) => s1 - s0 > 0.5)
+        .map(([s0, s1], segmentIdx) => {
+          const access = segmentAccessAgainstFieldIntervals([s0, s1], fieldIntervals, 0.35);
+          const touchesObstacle = intervalTouchesBlockedGap([s0, s1], blockedIntervals, 0.35);
+          return {
+            s0,
+            s1,
+            segmentIdx,
+            touchMin: access.touchMin,
+            touchMax: access.touchMax,
+            obstacleLimited: touchesObstacle,
+            deadEnd: touchesObstacle || !(access.touchMin && access.touchMax)
+          };
+        });
+      if (segments.length) {
+        rowGroups.push({idx: rowIdx, t, segments});
+        rowSegmentCount += segments.length;
+      }
+    });
+    if (!rowGroups.length) return setStatus('No rows generated. Check R2R/offset/field shape or obstacle size/location.');
+    if (rowSegmentCount > maxRows) {
+      updateLayer('row-lines', fc([])); updateLayer('turn-lines', fc([])); updateLayer('headland-lines', fc([])); clearLabels();
+      return setStatus(`Too many row segments generated (${rowSegmentCount}). Increase R2R or Max rows safety cap. This protection prevents browser freeze.`);
+    }
+
+    const startSide = Math.abs(0 - sMinWork) <= Math.abs(0 - sMaxWork) ? 'min' : 'max';
+    const plannerGroups = buildObstacleAwareOperationGroups(rowGroups, $('logic').value, jump, startSide, sMinWork, sMaxWork);
+    const rowFeatures = [];
+    const turnFeatures = [];
+    const fullPathCoords = [];
+    clearLabels();
+
+    let operationPassNo = 0;
+    let obstacleReturnCount = 0;
+    let previousOperationWasDeadEnd = false;
+    let previousZoneKey = null;
+    const sequencePreview = [];
+
+    plannerGroups.forEach((group, groupIdx) => {
+      let firstCoordForGroupLabel = null;
+
+      group.ops.forEach((op, localOpIdx) => {
+        const r = op.row;
+        const seg = op.seg;
+        const deadEnd = op.deadEnd;
+        const rowForwardPreference = op.forward;
+        let startST, endST, returnST = null;
+
+        if (deadEnd) {
+          // Obstacle-aware segment planner:
+          // The split piece is entered only from its reachable headland side.
+          // The machine goes up to the dark-pink obstacle-safe boundary and
+          // returns on the same row. It never side-bypasses to the other split
+          // piece of the same row.
+          const accessFromMin = op.entrySide === 'min';
+          startST = {s: accessFromMin ? seg.s0 : seg.s1, t: r.t};
+          endST = {s: accessFromMin ? seg.s1 : seg.s0, t: r.t};
+          returnST = startST;
+        } else {
+          startST = {s: rowForwardPreference ? seg.s0 : seg.s1, t: r.t};
+          endST = {s: rowForwardPreference ? seg.s1 : seg.s0, t: r.t};
+        }
+
+        const startLL = stToLngLat(startST, proj, origin, u, normal);
+        const endLL = stToLngLat(endST, proj, origin, u, normal);
+        if (!firstCoordForGroupLabel) firstCoordForGroupLabel = startLL;
+
+        rowFeatures.push(line([startLL, endLL], {
+          type: deadEnd ? 'working_row_to_obstacle_then_return' : 'working_row',
+          row:r.idx+1,
+          row_segment:seg.segmentIdx+1,
+          pass:operationPassNo+1,
+          planner_group:group.key,
+          planner_group_name:group.name,
+          obstacle_aware:true,
+          dead_end_return:deadEnd,
+          entry_side:op.entrySide || null
+        }));
+
+        if (fullPathCoords.length === 0) {
+          fullPathCoords.push(startLL);
+        } else {
+          const prev = fullPathCoords[fullPathCoords.length-1];
+          const prevST = xyToST(proj.toXY(prev), proj.toXY(origin), u, normal);
+          const forceBoundary = previousOperationWasDeadEnd || deadEnd || (previousZoneKey !== null && previousZoneKey !== group.key);
+          const connST = forceBoundary
+            ? boundaryFirstConnectorSafe(prevST, startST, safeRingST, obstacleRingsST, minSOuter, maxSOuter, offsetM, turnExt, operationPassNo)
+            : turnConnectorSafe(prevST, startST, safeRingST, obstacleRingsST, minSOuter, maxSOuter, offsetM, turnExt, operationPassNo);
+          const conn = connST.map(st => stToLngLat(st, proj, origin, u, normal));
+          turnFeatures.push(line(conn, {
+            type: forceBoundary ? 'obstacle_zone_safe_transition' : 'turn_connection',
+            from_pass:operationPassNo,
+            to_pass:operationPassNo+1,
+            from_group:previousZoneKey,
+            to_group:group.key,
+            field_safe:true,
+            obstacle_aware:true,
+            follows_selected_row_logic:true,
+            no_same_row_obstacle_bypass:forceBoundary
+          }));
+          conn.slice(1).forEach(c => fullPathCoords.push(c));
+        }
+
+        fullPathCoords.push(endLL);
+
+        if (deadEnd && returnST) {
+          const returnLL = stToLngLat(returnST, proj, origin, u, normal);
+          turnFeatures.push(line([endLL, returnLL], {
+            type:'return_back_from_obstacle_boundary',
+            row:r.idx+1,
+            row_segment:seg.segmentIdx+1,
+            pass:operationPassNo+1,
+            planner_group:group.key,
+            field_safe:true,
+            obstacle_aware:true
+          }));
+          fullPathCoords.push(returnLL);
+          obstacleReturnCount++;
+        }
+
+        if (sequencePreview.length < 30) {
+          const suffix = deadEnd ? (op.entrySide === 'min' ? 'A' : 'B') : '';
+          sequencePreview.push(`R${r.idx+1}${suffix}`);
+        }
+        previousOperationWasDeadEnd = deadEnd;
+        previousZoneKey = group.key;
+        operationPassNo++;
+      });
+
+      if ($('showMarkers').checked && firstCoordForGroupLabel && (groupIdx % labelEvery === 0)) {
+        addLabel(firstCoordForGroupLabel, `${groupIdx+1}: ${group.name}`);
+      }
+    });
+
+    const headlandFeatures = [];
+    let headlandPassCount = 0;
+    if ($('showHeadland').checked && offsetM > 0) {
+      const headland = buildTurnSideHeadlandCoverage(safeRingST, obstacleRingsST, minSOuter, maxSOuter, offsetM, r2r, sideClearanceM, proj, origin, u, normal);
+      headlandFeatures.push(...headland.features);
+      headlandPassCount = headland.segments.length;
+      appendSegmentsGreedy(fullPathCoords, headland.segments, turnFeatures, (fromLL, toLL, seq) => {
+        const pST = xyToST(proj.toXY(fromLL), proj.toXY(origin), u, normal);
+        const qST = xyToST(proj.toXY(toLL), proj.toXY(origin), u, normal);
+        return turnConnectorSafe(pST, qST, safeRingST, obstacleRingsST, minSOuter, maxSOuter, offsetM, 0, seq).map(st => stToLngLat(st, proj, origin, u, normal));
+      });
+    }
+
+    updateLayer('row-labels', fc(state.labelFeatures));
+    updateLayer('row-lines', fc(rowFeatures));
+    updateLayer('turn-lines', fc(turnFeatures));
+    updateLayer('headland-lines', fc(headlandFeatures));
+    state.lastGeojson = fc([outerPoly, workPoly, ...obstacleAvoidanceFeatures, ...offsetGuideFeatures, ...rowFeatures, ...turnFeatures, ...headlandFeatures, line(fullPathCoords, {type:'complete_machine_path'})]);
+    prepareSimulation(fullPathCoords);
+
+    const areaHa = turf.area(outerPoly)/10000;
+    const workHa = turf.area(workPoly)/10000;
+    setStatus(`<span class="pill">Area: ${areaHa.toFixed(3)} ha</span><span class="pill">Main row area: ${workHa.toFixed(3)} ha</span><span class="pill">Rows: ${rowGroups.length}</span><span class="pill">Row segments: ${rowSegmentCount}</span><span class="pill">Planner groups: ${plannerGroups.length}</span><span class="pill">Machine operations: ${operationPassNo}</span><span class="pill">Obstacle returns: ${obstacleReturnCount}</span><span class="pill">Offset strip passes: ${headlandPassCount}</span><br>Offset mode: turn-side headland + full field-safe boundary clearance. Boundary clearance = ${sideClearanceM.toFixed(2)} m (${sideClearanceFactor.toFixed(2)} × R2R), so no generated operation should cross the red field boundary or dark-pink obstacle clearance boundary. If an obstacle splits a row, the machine now returns on the same path; transitions around the object use the inward safe field perimeter/headland, not a diagonal side bypass.<br><span class="pill">Obstacles: ${state.obstacles.length}</span><br>Requested headland: ${requestedOffsetM.toFixed(2)} m; Effective turn-side offset: ${offsetM.toFixed(2)} m.<br>Sequence: ${sequencePreview.join(' → ')}${operationPassNo>sequencePreview.length?' ...':''}`);
+  }
+
+  function clipPolygonBySRange(ring, minS, maxS) {
+    let out = cleanRingST(ring.slice());
+    out = clipHalfPlaneST(out, p => p.s >= minS - 1e-7, (a,b) => intersectAtS(a,b,minS));
+    out = clipHalfPlaneST(out, p => p.s <= maxS + 1e-7, (a,b) => intersectAtS(a,b,maxS));
+    return cleanRingST(out);
+  }
+
+  function clipHalfPlaneST(input, inside, intersect) {
+    if (!input || input.length < 3) return [];
+    const output = [];
+    for (let i=0; i<input.length; i++) {
+      const a = input[i];
+      const b = input[(i+1) % input.length];
+      const aIn = inside(a);
+      const bIn = inside(b);
+      if (aIn && bIn) output.push(b);
+      else if (aIn && !bIn) output.push(intersect(a,b));
+      else if (!aIn && bIn) { output.push(intersect(a,b)); output.push(b); }
+    }
+    return cleanRingST(output);
+  }
+
+  function intersectAtS(a, b, s) {
+    const den = b.s - a.s;
+    if (Math.abs(den) < 1e-9) return {s, t:a.t};
+    const f = (s - a.s) / den;
+    return {s, t:a.t + f * (b.t - a.t)};
+  }
+
+  function cleanRingST(ring) {
+    const out = [];
+    (ring || []).forEach(p => {
+      if (!p || !Number.isFinite(p.s) || !Number.isFinite(p.t)) return;
+      const last = out[out.length-1];
+      if (!last || Math.hypot(last.s-p.s, last.t-p.t) > 1e-6) out.push({s:p.s, t:p.t});
+    });
+    if (out.length > 1 && Math.hypot(out[0].s-out[out.length-1].s, out[0].t-out[out.length-1].t) <= 1e-6) out.pop();
+    return out;
+  }
+
+  function buildConstantSLines(ringST, sValue, proj, originLL, u, normal, props) {
+    const features = [];
+    const ts = verticalIntersections(ringST, sValue).sort((a,b)=>a-b);
+    for (let k=0; k<ts.length-1; k+=2) {
+      if (ts[k+1] - ts[k] > 0.5) {
+        features.push(line([
+          stToLngLat({s:sValue, t:ts[k]}, proj, originLL, u, normal),
+          stToLngLat({s:sValue, t:ts[k+1]}, proj, originLL, u, normal)
+        ], props));
+      }
+    }
+    return features;
+  }
+
+  function buildConstantTLines(ringST, tValue, proj, originLL, u, normal, props) {
+    const features = [];
+    const ss = horizontalIntersections(ringST, tValue).sort((a,b)=>a-b);
+    for (let k=0; k<ss.length-1; k+=2) {
+      if (ss[k+1] - ss[k] > 0.5) {
+        features.push(line([
+          stToLngLat({s:ss[k], t:tValue}, proj, originLL, u, normal),
+          stToLngLat({s:ss[k+1], t:tValue}, proj, originLL, u, normal)
+        ], props));
+      }
+    }
+    return features;
+  }
+
+  function buildTurnSideHeadlandCoverage(ringST, obstacleRingsST, minSOuter, maxSOuter, offsetM, r2r, sideClearanceM, proj, originLL, u, normal) {
+    // ringST is already the inward-buffered safe polygon. Therefore these headland
+    // passes are field-safe centre-lines. They cover only the two turning-side strips,
+    // from safe boundary up to the main-row inner offset line.
+    const segments = [];
+    const minSSafe = Math.min(...ringST.map(p=>p.s));
+    const maxSSafe = Math.max(...ringST.map(p=>p.s));
+    const startInner = Math.min(minSOuter + offsetM, maxSSafe);
+    const endInner = Math.max(maxSOuter - offsetM, minSSafe);
+
+    const addStrip = (a, b, stripName, physicalSide) => {
+      a = Math.max(a, minSSafe);
+      b = Math.min(b, maxSSafe);
+      if (b <= a + 0.05) return;
+      const sValues = [];
+      if (physicalSide === 'min') {
+        let s = a;
+        let guard = 0;
+        while (s <= b + 0.001 && guard++ < 5000) {
+          sValues.push(Math.min(s, b));
+          s += r2r;
+        }
+        if (b - sValues[sValues.length-1] > r2r * 0.35) sValues.push(b);
+      } else {
+        let s = b;
+        let guard = 0;
+        while (s >= a - 0.001 && guard++ < 5000) {
+          sValues.push(Math.max(s, a));
+          s -= r2r;
+        }
+        if (sValues[sValues.length-1] - a > r2r * 0.35) sValues.push(a);
+        sValues.reverse();
+      }
+      const cleanS = [...new Set(sValues.map(v => +v.toFixed(6)))].sort((x,y)=>x-y);
+      cleanS.forEach((sValue, localIdx) => {
+        const fieldIntervals = intervalsFromIntersections(verticalIntersections(ringST, sValue));
+        const blockedIntervals = [];
+        obstacleRingsST.forEach(obsRing => blockedIntervals.push(...intervalsFromIntersections(verticalIntersections(obsRing, sValue))));
+        const freeIntervals = subtractIntervals(fieldIntervals, blockedIntervals, 0.08);
+        freeIntervals.forEach(([t0, t1], freeIdx) => {
+          if (t1 - t0 > 0.5) {
+            const coords = [
+              stToLngLat({s:sValue, t:t0}, proj, originLL, u, normal),
+              stToLngLat({s:sValue, t:t1}, proj, originLL, u, normal)
+            ];
+            segments.push({coords, props:{type:'turn_side_offset_rotavation', strip:stripName, pass:localIdx+1, segment:freeIdx+1, field_safe:true, obstacle_aware:true}});
+          }
+        });
+      });
+    };
+
+    addStrip(minSSafe, startInner, 'start_turn_side', 'min');
+    addStrip(endInner, maxSSafe, 'end_turn_side', 'max');
+    const features = segments.map(s => line(s.coords, s.props));
+    return {features, segments};
+  }
+
+  function appendSegmentsGreedy(pathCoords, segments, connectorFeatures, routeBuilder=null) {
+    if (!pathCoords.length || !segments || !segments.length) return;
+    const pending = segments.map((s, i) => ({...s, id:i}));
+    let current = pathCoords[pathCoords.length-1];
+    let guard = 0;
+    while (pending.length && guard++ < segments.length + 5) {
+      let bestIndex = -1;
+      let bestReverse = false;
+      let bestDistance = Infinity;
+      for (let i=0; i<pending.length; i++) {
+        const seg = pending[i];
+        const d0 = meterDistance(current, seg.coords[0]);
+        const d1 = meterDistance(current, seg.coords[seg.coords.length-1]);
+        if (d0 < bestDistance) { bestDistance = d0; bestIndex = i; bestReverse = false; }
+        if (d1 < bestDistance) { bestDistance = d1; bestIndex = i; bestReverse = true; }
+      }
+      if (bestIndex < 0) break;
+      const chosen = pending.splice(bestIndex, 1)[0];
+      const coords = bestReverse ? chosen.coords.slice().reverse() : chosen.coords.slice();
+      const start = coords[0];
+      if (meterDistance(current, start) > 0.2) {
+        const route = routeBuilder ? routeBuilder(current, start, guard) : [current, start];
+        connectorFeatures.push(line(route, {type:'transition_to_offset_strip', field_safe:!!routeBuilder}));
+        route.slice(1).forEach(c => pathCoords.push(c));
+      }
+      coords.slice(1).forEach(c => pathCoords.push(c));
+      current = pathCoords[pathCoords.length-1];
+    }
+  }
+
+  function verticalIntersections(ring, s) {
+    const ys = [];
+    for (let i=0;i<ring.length;i++) {
+      const a=ring[i], b=ring[(i+1)%ring.length];
+      if ((a.s <= s && b.s > s) || (b.s <= s && a.s > s)) {
+        const f = (s-a.s)/(b.s-a.s);
+        ys.push(a.t + f*(b.t-a.t));
+      }
+    }
+    return ys;
+  }
+
+
+  function polygonOuterRings(feature) {
+    if (!feature || !feature.geometry) return [];
+    const g = feature.geometry;
+    if (g.type === 'Polygon') return [(g.coordinates[0] || []).slice(0, -1)];
+    if (g.type === 'MultiPolygon') return g.coordinates.map(polyCoords => (polyCoords[0] || []).slice(0, -1)).filter(r => r.length >= 3);
+    return [];
+  }
+
+  function intervalsFromIntersections(values) {
+    const vals = (values || []).filter(Number.isFinite).sort((a,b)=>a-b);
+    const out = [];
+    for (let i=0; i<vals.length-1; i+=2) {
+      if (vals[i+1] > vals[i]) out.push([vals[i], vals[i+1]]);
+    }
+    return out;
+  }
+
+  function subtractIntervals(baseIntervals, blockedIntervals, margin=0) {
+    let free = (baseIntervals || []).map(([a,b]) => [Math.min(a,b), Math.max(a,b)]);
+    const blockers = (blockedIntervals || [])
+      .map(([a,b]) => [Math.min(a,b) - margin, Math.max(a,b) + margin])
+      .sort((a,b)=>a[0]-b[0]);
+    blockers.forEach(([ba, bb]) => {
+      const next = [];
+      free.forEach(([fa, fb]) => {
+        if (bb <= fa || ba >= fb) next.push([fa, fb]);
+        else {
+          if (ba > fa) next.push([fa, Math.min(ba, fb)]);
+          if (bb < fb) next.push([Math.max(bb, fa), fb]);
+        }
+      });
+      free = next;
+    });
+    return free.filter(([a,b]) => b - a > 0.05);
+  }
+
+
+  function segmentAccessAgainstFieldIntervals(seg, fieldIntervals, eps=0.35) {
+    const s0 = Math.min(seg[0], seg[1]);
+    const s1 = Math.max(seg[0], seg[1]);
+    let touchMin = false;
+    let touchMax = false;
+    (fieldIntervals || []).forEach(([fa0, fb0]) => {
+      const fa = Math.min(fa0, fb0);
+      const fb = Math.max(fa0, fb0);
+      const overlaps = s1 >= fa - eps && s0 <= fb + eps;
+      if (!overlaps) return;
+      if (Math.abs(s0 - fa) <= eps) touchMin = true;
+      if (Math.abs(s1 - fb) <= eps) touchMax = true;
+    });
+    return {touchMin, touchMax};
+  }
+
+  function intervalTouchesBlockedGap(seg, blockedIntervals, eps=0.35) {
+    const s0 = Math.min(seg[0], seg[1]);
+    const s1 = Math.max(seg[0], seg[1]);
+    for (const [ba0, bb0] of (blockedIntervals || [])) {
+      const ba = Math.min(ba0, bb0);
+      const bb = Math.max(ba0, bb0);
+      if (Math.abs(s1 - ba) <= eps || Math.abs(s0 - bb) <= eps) return true;
+    }
+    return false;
+  }
+
+  function meterDistance(a, b) {
+    if (!a || !b) return Infinity;
+    return turf.distance(turf.point(a), turf.point(b), {units:'meters'});
+  }
+
+  function buildRowOrder(count, jump, logic) {
+    if (count <= 0) return [];
+    if (logic === 'adjacent') return [...Array(count).keys()];
+    if (logic === 'custom146') return buildCustom146Order(count);
+
+    // Legacy demo logic is kept safe in case an old browser selection is cached.
+    // Earlier this could freeze because the loop continued even when no valid row was added.
+    if (logic === 'demo1427') {
+      const out=[], used=new Set(); let seed=0; let guard=0;
+      while(out.length<count && guard++ < count * 4 + 20) {
+        const before = out.length;
+        [seed, seed+jump, seed+1].forEach(i => {
+          if (i>=0 && i<count && !used.has(i)) { used.add(i); out.push(i); }
+        });
+        seed += jump + 1;
+        if (before === out.length && seed > count + jump + 2) break;
+      }
+      for(let i=0;i<count;i++) if(!used.has(i)) out.push(i);
+      return out;
+    }
+
+    const unused = new Set([...Array(count).keys()]);
+    const out = [0]; unused.delete(0);
+    while (unused.size) {
+      const cur = out[out.length-1];
+      const candidates = [...unused]
+        .filter(i => Math.abs(i-cur) >= jump)
+        .sort((a,b)=>Math.abs(a-cur)-Math.abs(b-cur));
+      const remaining = [...unused].sort((a,b)=>Math.abs(a-cur)-Math.abs(b-cur));
+      const next = candidates.length ? candidates[0] : remaining[0];
+      if (next === undefined) break;
+      out.push(next); unused.delete(next);
+    }
+    return out;
+  }
+
+  function buildCustom146Order(count) {
+    // Generates: 1,4,2,6,3,8,5,10,7,12,9...
+    // At the end, any row that cannot make the preferred jump is appended safely.
+    const out = [];
+    const used = new Set();
+    const addRowNo = (rowNo) => {
+      const idx = rowNo - 1;
+      if (idx >= 0 && idx < count && !used.has(idx)) {
+        used.add(idx);
+        out.push(idx);
+      }
+    };
+
+    const nearSideRows = [1, 2, 3];
+    for (let rowNo = 5; rowNo <= count + 2; rowNo += 2) nearSideRows.push(rowNo);
+
+    const maxPairs = count + 5;
+    for (let k = 0; k < maxPairs && out.length < count; k++) {
+      const nearRow = nearSideRows[k];
+      const farJumpRow = 4 + (2 * k);
+      addRowNo(nearRow);
+      addRowNo(farJumpRow);
+    }
+
+    for (let i = 0; i < count; i++) {
+      if (!used.has(i)) { used.add(i); out.push(i); }
+    }
+    return out;
+  }
+
+
+  function buildObstacleAwareOperationGroups(rowGroups, logic, jump, startSide, sMinWork, sMaxWork) {
+    // Planner-level obstacle fix:
+    // First split rows into operations, then apply the selected row order separately
+    // to each reachable operation zone. This prevents the older behaviour where
+    // the row order was made first and obstacle pieces were handled afterwards,
+    // which caused side-bypass/odd connectors around wells.
+    const allOps = [];
+    let hasObstacleSplitOps = false;
+
+    rowGroups.forEach(row => {
+      row.segments.forEach(seg => {
+        const zone = classifyOperationZone(seg, sMinWork, sMaxWork);
+        const deadEnd = zone !== 'full' || !!seg.deadEnd || row.segments.length > 1;
+        if (deadEnd) hasObstacleSplitOps = true;
+        const entrySide = zone === 'max' ? 'max' : 'min';
+        allOps.push({ row, seg, zone, deadEnd, entrySide });
+      });
+    });
+
+    if (!allOps.length) return [];
+
+    if (!hasObstacleSplitOps) {
+      return [{
+        key:'normal_full_rows',
+        name:'Normal rows',
+        side:null,
+        ops:orderOpsInsideZone(allOps, logic, jump, null)
+      }];
+    }
+
+    const otherSide = startSide === 'min' ? 'max' : 'min';
+    const preferredZones = [startSide, 'full', otherSide, 'middle'];
+    const groups = [];
+    preferredZones.forEach(zone => {
+      const ops = allOps.filter(op => op.zone === zone);
+      if (!ops.length) return;
+      const ordered = orderOpsInsideZone(ops, logic, jump, zone);
+      groups.push({
+        key:`zone_${zone}`,
+        name: zone === 'full' ? 'Full rows' : (zone === 'middle' ? 'Middle obstacle pocket' : `${zone === 'min' ? 'Start-side' : 'End-side'} obstacle rows`),
+        side: zone === 'min' || zone === 'max' ? zone : null,
+        ops: ordered
+      });
+    });
+    return groups;
+  }
+
+  function classifyOperationZone(seg, sMinWork, sMaxWork) {
+    if (seg.touchMin && seg.touchMax && !seg.obstacleLimited && !seg.deadEnd) return 'full';
+    if (seg.touchMin && !seg.touchMax) return 'min';
+    if (seg.touchMax && !seg.touchMin) return 'max';
+    if (seg.touchMin && seg.touchMax) return 'full';
+
+    // Rare case: a segment is trapped between two obstacle boundaries. Assign it
+    // to the nearest headland side so the planner never loops or side-bypasses.
+    const c = (seg.s0 + seg.s1) / 2;
+    const dMin = Math.abs(c - sMinWork);
+    const dMax = Math.abs(sMaxWork - c);
+    if (Math.min(dMin, dMax) < Math.max(1, Math.abs(sMaxWork - sMinWork) * 0.15)) return dMin <= dMax ? 'min' : 'max';
+    return 'middle';
+  }
+
+  function orderOpsInsideZone(ops, logic, jump, zone) {
+    const rows = [...new Set(ops.map(op => op.row.idx))].sort((a,b)=>a-b);
+    const byRow = new Map();
+    ops.forEach(op => {
+      if (!byRow.has(op.row.idx)) byRow.set(op.row.idx, []);
+      byRow.get(op.row.idx).push(op);
+    });
+
+    const order = buildRowOrder(rows.length, jump, logic);
+    const out = [];
+    order.forEach((relativeRowIdx, orderPassIdx) => {
+      const rowIdx = rows[relativeRowIdx];
+      const rowOps = (byRow.get(rowIdx) || []).slice().sort((a,b)=>a.seg.s0-b.seg.s0);
+
+      // For start-side and end-side obstacle groups there is normally one piece
+      // per row. If multiple pieces still exist, keep them from the reachable
+      // side first. This keeps the same selected row order around obstacles.
+      if (zone === 'max') rowOps.reverse();
+      rowOps.forEach((op, opIdx) => {
+        const copy = {...op};
+        copy.forward = orderPassIdx % 2 === 0;
+        if (zone === 'min') copy.entrySide = 'min';
+        else if (zone === 'max') copy.entrySide = 'max';
+        else if (copy.deadEnd) copy.entrySide = copy.entrySide || (copy.seg.touchMax && !copy.seg.touchMin ? 'max' : 'min');
+        out.push(copy);
+      });
+    });
+    return out;
+  }
+
+  function boundaryFirstConnectorSafe(p, q, safeRing, obstacleRings, minSOuter, maxSOuter, offsetM, ext, passIdx) {
+    // Used for transitions between obstacle operation zones. Boundary first is
+    // intentional: after returning from an obstacle, the machine should move via
+    // safe headland/perimeter lanes, not diagonally around the well.
+    const boundaryRoute = boundaryConnectorST(p, q, safeRing, obstacleRings || []);
+    if (boundaryRoute && boundaryRoute.length >= 2 && polylineInsideFreeST(boundaryRoute, safeRing, obstacleRings || [])) return boundaryRoute;
+    const headlandRoute = headlandConnectorSafe(p, q, safeRing, obstacleRings || [], minSOuter, maxSOuter, offsetM, ext, passIdx);
+    if (headlandRoute && headlandRoute.length >= 2 && polylineInsideFreeST(headlandRoute, safeRing, obstacleRings || [])) return headlandRoute;
+    return turnConnectorSafe(p, q, safeRing, obstacleRings || [], minSOuter, maxSOuter, offsetM, ext, passIdx);
+  }
+
+
+  function headlandConnectorSafe(p, q, safeRing, obstacleRings, minSOuter, maxSOuter, offsetM, ext, passIdx) {
+    // Used after an obstacle dead-end return. It prefers travelling through
+    // clear headland / side-clearance lanes instead of drawing a same-row
+    // bypass around the obstacle.
+    obstacleRings = obstacleRings || [];
+    const candidates = [];
+    const minTurnS = minSOuter + offsetM;
+    const maxTurnS = maxSOuter - offsetM;
+    const ts = safeRing.map(v => v.t);
+    const minT = Math.min(...ts), maxT = Math.max(...ts);
+    const spanT = Math.max(0, maxT - minT);
+    const tOptions = [
+      minT,
+      maxT,
+      minT + spanT * 0.08,
+      maxT - spanT * 0.08,
+      minT + spanT * 0.18,
+      maxT - spanT * 0.18
+    ].filter(Number.isFinite);
+
+    // Prefer lanes along the row-spacing side of the safe field. These are
+    // equivalent to travelling back through the already planned safe/headland area.
+    [...new Set(tOptions.map(v => +v.toFixed(6)))].forEach(tv => {
+      candidates.push(cleanPathST([p, {s:p.s, t:tv}, {s:q.s, t:tv}, q]));
+    });
+
+    // Also try the selected turn-side headlands.
+    [minTurnS, maxTurnS].forEach(sv => {
+      candidates.push(cleanPathST([p, {s:sv, t:p.t}, {s:sv, t:q.t}, q]));
+    });
+
+    // Try simple headland/side-lane candidates first.
+    for (const cand of candidates) {
+      if (cand.length >= 2 && polylineInsideFreeST(cand, safeRing, obstacleRings)) return cand;
+    }
+
+    // Important obstacle fine-tuning: when the machine returns from an obstacle,
+    // do not allow a diagonal connector near the obstacle. Follow the inward safe
+    // boundary first, like the obstacle/field boundary is a no-go wall.
+    const boundaryRoute = boundaryConnectorST(p, q, safeRing, obstacleRings);
+    if (boundaryRoute && boundaryRoute.length >= 2) return boundaryRoute;
+
+    return turnConnectorSafe(p, q, safeRing, obstacleRings, minSOuter, maxSOuter, offsetM, ext, passIdx);
+  }
+
+  function turnConnectorSafe(p, q, safeRing, obstacleRings, minSOuter, maxSOuter, offsetM, ext, passIdx) {
+    // Route turn connections through the inward-buffered safe polygon and around
+    // dark-pink obstacle avoidance rings. Obstacles are treated like internal boundaries.
+    obstacleRings = obstacleRings || [];
+    const candidates = [];
+    const minTurnS = minSOuter + offsetM;
+    const maxTurnS = maxSOuter - offsetM;
+    const side = (Math.abs(p.s - minTurnS) + Math.abs(q.s - minTurnS)) <= (Math.abs(p.s - maxTurnS) + Math.abs(q.s - maxTurnS)) ? 'min' : 'max';
+    const baseS = side === 'min' ? minTurnS : maxTurnS;
+    const extS = side === 'min' ? baseS - ext : baseS + ext;
+    const sOptions = [p.s, q.s, baseS, extS]
+      .filter(v => Number.isFinite(v))
+      .map(v => +v.toFixed(6));
+    [...new Set(sOptions)].forEach(sv => {
+      candidates.push(cleanPathST([p, {s:sv, t:p.t}, {s:sv, t:q.t}, q]));
+      candidates.push(cleanPathST([p, {s:sv, t:q.t}, q]));
+    });
+    candidates.push(cleanPathST([p, q]));
+
+    for (const cand of candidates) {
+      if (cand.length >= 2 && polylineInsideFreeST(cand, safeRing, obstacleRings)) return cand;
+    }
+
+    // Prefer the inward safe boundary before any graph fallback. This stops the
+    // orange travelled path from cutting diagonally around wells or outside-looking
+    // corners when an obstacle has split nearby rows.
+    const boundaryRoute = boundaryConnectorST(p, q, safeRing, obstacleRings);
+    if (boundaryRoute && boundaryRoute.length >= 2) return boundaryRoute;
+
+    const vis = visibilityPathST(p, q, safeRing, obstacleRings);
+    if (vis && vis.length >= 2 && polylineInsideFreeST(vis, safeRing, obstacleRings)) return vis;
+
+    // Last-resort only. Boundary and visibility routes above should normally solve this.
+    // Keep a valid two-point LineString rather than freezing/breaking rendering.
+    return cleanPathST([p, q]);
+  }
+
+  function cleanPathST(path) {
+    const out = [];
+    (path || []).forEach(p => {
+      if (!p || !Number.isFinite(p.s) || !Number.isFinite(p.t)) return;
+      const last = out[out.length-1];
+      if (!last || Math.hypot(last.s-p.s, last.t-p.t) > 1e-6) out.push({s:p.s, t:p.t});
+    });
+    return out;
+  }
+
+  function polylineInsideFreeST(path, ring, obstacleRings=[]) {
+    for (let i=0; i<path.length-1; i++) {
+      if (!segmentInsideFreeST(path[i], path[i+1], ring, obstacleRings)) return false;
+    }
+    return true;
+  }
+
+  function segmentInsideFreeST(a, b, ring, obstacleRings=[]) {
+    const dist = Math.hypot(b.s-a.s, b.t-a.t);
+    const steps = Math.max(8, Math.min(120, Math.ceil(dist / 1.2)));
+    for (let i=0; i<=steps; i++) {
+      const f = i / steps;
+      const p = {s:a.s + (b.s-a.s)*f, t:a.t + (b.t-a.t)*f};
+      if (!pointInFreeST(p, ring, obstacleRings)) return false;
+    }
+    return true;
+  }
+
+  function pointInFreeST(p, ring, obstacleRings=[]) {
+    if (!pointInRingST(p, ring)) return false;
+    return !pointInAnyObstacleST(p, obstacleRings);
+  }
+
+  function pointInAnyObstacleST(p, obstacleRings=[]) {
+    for (const obs of obstacleRings) {
+      // Boundary of the inflated obstacle is accepted as usable centreline boundary.
+      // Interior is blocked.
+      let onBoundary = false;
+      for (let i=0; i<obs.length; i++) {
+        if (pointOnSegmentST(p, obs[i], obs[(i+1)%obs.length], 1e-5)) { onBoundary = true; break; }
+      }
+      if (!onBoundary && pointInRingST(p, obs)) return true;
+    }
+    return false;
+  }
+
+  function pointInRingST(p, ring) {
+    // Boundary is accepted as inside because the ring is already the inward safe boundary.
+    for (let i=0; i<ring.length; i++) {
+      if (pointOnSegmentST(p, ring[i], ring[(i+1)%ring.length], 1e-5)) return true;
+    }
+    let inside = false;
+    for (let i=0, j=ring.length-1; i<ring.length; j=i++) {
+      const pi = ring[i], pj = ring[j];
+      const intersect = ((pi.t > p.t) !== (pj.t > p.t)) &&
+        (p.s < (pj.s - pi.s) * (p.t - pi.t) / ((pj.t - pi.t) || 1e-12) + pi.s);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function pointOnSegmentST(p, a, b, eps=1e-6) {
+    const vx = b.s-a.s, vy = b.t-a.t;
+    const wx = p.s-a.s, wy = p.t-a.t;
+    const c = vx*wy - vy*wx;
+    if (Math.abs(c) > eps * Math.max(1, Math.hypot(vx, vy))) return false;
+    const d = wx*vx + wy*vy;
+    if (d < -eps) return false;
+    const len2 = vx*vx + vy*vy;
+    if (d - len2 > eps) return false;
+    return true;
+  }
+
+
+  function boundaryConnectorST(p, q, safeRing, obstacleRings=[]) {
+    // Perimeter-following fallback for obstacle cases.
+    // It prevents a diagonal / outside-looking connector from being drawn when the
+    // machine has returned from an obstacle dead-end and needs to reach another
+    // reachable row section. The path snaps to the inward safe boundary, follows
+    // the safe field perimeter, then returns to the target point.
+    if (!safeRing || safeRing.length < 3 || !p || !q) return null;
+    const snapP = nearestPointOnRingST(p, safeRing);
+    const snapQ = nearestPointOnRingST(q, safeRing);
+    if (!snapP || !snapQ) return null;
+
+    const clockwise = ringPathForwardST(snapP, snapQ, safeRing);
+    const counterClockwise = ringPathForwardST(snapQ, snapP, safeRing).reverse();
+    const candidates = [clockwise, counterClockwise].map(boundaryPart => {
+      const route = [p];
+      if (Math.hypot(p.s - snapP.point.s, p.t - snapP.point.t) > 1e-6) route.push(snapP.point);
+      boundaryPart.forEach(pt => route.push(pt));
+      if (Math.hypot(q.s - snapQ.point.s, q.t - snapQ.point.t) > 1e-6) route.push(snapQ.point);
+      route.push(q);
+      return cleanPathST(route);
+    });
+
+    let best = null;
+    let bestLen = Infinity;
+    for (const cand of candidates) {
+      if (cand.length < 2) continue;
+      if (!polylineInsideFreeST(cand, safeRing, obstacleRings)) continue;
+      const len = pathLengthST(cand);
+      if (len < bestLen) { best = cand; bestLen = len; }
+    }
+    return best;
+  }
+
+  function ringPathForwardST(aSnap, bSnap, ring) {
+    const n = ring.length;
+    if (!aSnap || !bSnap || n < 3) return [];
+    const eA = aSnap.edgeIdx;
+    const eB = bSnap.edgeIdx;
+    const path = [aSnap.point];
+
+    if (eA === eB && bSnap.f >= aSnap.f) {
+      path.push(bSnap.point);
+      return cleanPathST(path);
+    }
+
+    let idx = (eA + 1) % n;
+    let guard = 0;
+    while (guard++ <= n + 2) {
+      path.push(ring[idx]);
+      if (idx === eB) break;
+      idx = (idx + 1) % n;
+    }
+    path.push(bSnap.point);
+    return cleanPathST(path);
+  }
+
+  function nearestPointOnRingST(p, ring) {
+    let best = null;
+    for (let i=0; i<ring.length; i++) {
+      const a = ring[i];
+      const b = ring[(i+1) % ring.length];
+      const np = nearestPointOnSegmentST(p, a, b);
+      if (!best || np.dist < best.dist) best = {...np, edgeIdx:i};
+    }
+    return best;
+  }
+
+  function nearestPointOnSegmentST(p, a, b) {
+    const vx = b.s - a.s;
+    const vy = b.t - a.t;
+    const len2 = vx*vx + vy*vy;
+    let f = len2 > 1e-12 ? ((p.s-a.s)*vx + (p.t-a.t)*vy) / len2 : 0;
+    f = Math.max(0, Math.min(1, f));
+    const point = {s:a.s + vx*f, t:a.t + vy*f};
+    const dist = Math.hypot(p.s - point.s, p.t - point.t);
+    return {point, f, dist};
+  }
+
+  function pathLengthST(path) {
+    let total = 0;
+    for (let i=1; i<(path || []).length; i++) {
+      total += Math.hypot(path[i].s - path[i-1].s, path[i].t - path[i-1].t);
+    }
+    return total;
+  }
+
+  function visibilityPathST(p, q, ring, obstacleRings=[]) {
+    // Lightweight fallback for concave/stepped fields and obstacle bypass:
+    // Dijkstra over visible field vertices + obstacle boundary vertices.
+    let fieldVerts = ring.slice();
+    const maxFieldVerts = 90;
+    if (fieldVerts.length > maxFieldVerts) {
+      const step = Math.ceil(fieldVerts.length / maxFieldVerts);
+      fieldVerts = fieldVerts.filter((_, idx) => idx % step === 0);
+    }
+    let obsVerts = [];
+    obstacleRings.forEach(obs => {
+      let verts = obs.slice();
+      const maxObsVerts = 42;
+      if (verts.length > maxObsVerts) {
+        const step = Math.ceil(verts.length / maxObsVerts);
+        verts = verts.filter((_, idx) => idx % step === 0);
+      }
+      obsVerts.push(...verts);
+    });
+    const nodes = [p, q, ...fieldVerts, ...obsVerts];
+    const n = nodes.length;
+    const adj = Array.from({length:n}, () => []);
+    for (let i=0; i<n; i++) {
+      for (let j=i+1; j<n; j++) {
+        if (segmentInsideFreeST(nodes[i], nodes[j], ring, obstacleRings)) {
+          const w = Math.hypot(nodes[i].s-nodes[j].s, nodes[i].t-nodes[j].t);
+          adj[i].push([j,w]); adj[j].push([i,w]);
+        }
+      }
+    }
+    const dist = Array(n).fill(Infinity), prev = Array(n).fill(-1), used = Array(n).fill(false);
+    dist[0] = 0;
+    for (let iter=0; iter<n; iter++) {
+      let uIdx = -1, best = Infinity;
+      for (let i=0; i<n; i++) if (!used[i] && dist[i] < best) { best = dist[i]; uIdx = i; }
+      if (uIdx === -1 || uIdx === 1) break;
+      used[uIdx] = true;
+      adj[uIdx].forEach(([v,w]) => {
+        if (dist[uIdx] + w < dist[v]) { dist[v] = dist[uIdx] + w; prev[v] = uIdx; }
+      });
+    }
+    if (!Number.isFinite(dist[1])) return null;
+    const path = [];
+    for (let at=1; at!==-1; at=prev[at]) path.push(nodes[at]);
+    path.reverse();
+    return cleanPathST(path);
+  }
+
+  function horizontalIntersections(ring, t) {
+    const xs = [];
+    for (let i=0;i<ring.length;i++) {
+      const a=ring[i], b=ring[(i+1)%ring.length];
+      if ((a.t <= t && b.t > t) || (b.t <= t && a.t > t)) {
+        const f = (t-a.t)/(b.t-a.t);
+        xs.push(a.s + f*(b.s-a.s));
+      }
+    }
+    return xs;
+  }
+
+  function makeProjector(originLL) {
+    const R = 6378137;
+    const lat0 = originLL[1] * Math.PI/180;
+    return {
+      toXY(ll) { return { x:(ll[0]-originLL[0])*Math.PI/180*R*Math.cos(lat0), y:(ll[1]-originLL[1])*Math.PI/180*R }; },
+      toLL(xy) { return [originLL[0] + xy.x/(R*Math.cos(lat0))*180/Math.PI, originLL[1] + xy.y/R*180/Math.PI]; }
+    };
+  }
+  function xyToST(p, o, u, n) { const x=p.x-o.x, y=p.y-o.y; return {s:x*u.x+y*u.y, t:x*n.x+y*n.y}; }
+  function stToLngLat(st, proj, originLL, u, n) { const o=proj.toXY(originLL); return proj.toLL({x:o.x + st.s*u.x + st.t*n.x, y:o.y + st.s*u.y + st.t*n.y}); }
+  function signedAreaST(r) { let a=0; for(let i=0;i<r.length;i++){const p=r[i],q=r[(i+1)%r.length]; a+=p.s*q.t-q.s*p.t;} return a/2; }
+  function averageST(r) { return r.reduce((a,p)=>({s:a.s+p.s/r.length,t:a.t+p.t/r.length}),{s:0,t:0}); }
+  function largestPolygon(f) { if (f.geometry.type === 'Polygon') return f; let best=null, area=-1; f.geometry.coordinates.forEach(coords => { const p={type:'Feature',properties:{},geometry:{type:'Polygon',coordinates:coords}}; const a=turf.area(p); if(a>area){best=p;area=a;} }); return best; }
+  function line(coords, props={}) { return { type:'Feature', properties:props, geometry:{type:'LineString', coordinates:coords} }; }
+  function poly(coords, props={}) { return { type:'Feature', properties:props, geometry:{type:'Polygon', coordinates:[coords]} }; }
+  function fc(features) { return { type:'FeatureCollection', features }; }
+  function updateLayer(id, data) { const src = map.getSource(id); if (src) src.setData(data); }
+  function setStatus(html) { $('status').innerHTML = html; }
+  function clearMarkers() { state.markers.forEach(m=>m.remove()); state.markers=[]; }
+  function clearLabels() { state.labelFeatures = []; updateLayer('row-labels', fc([])); }
+  function addLabel(coord, text) {
+    state.labelFeatures.push({ type:'Feature', properties:{label:text}, geometry:{type:'Point', coordinates:coord} });
+  }
+
+  function prepareSimulation(coords) {
+    const clean = (coords || []).filter(c => Array.isArray(c) && c.length >= 2 && Number.isFinite(c[0]) && Number.isFinite(c[1]));
+    state.sim.path = clean;
+    state.sim.cum = [0];
+    state.sim.totalDistance = 0;
+    state.sim.distance = 0;
+    for (let i=1; i<clean.length; i++) {
+      const d = turf.distance(turf.point(clean[i-1]), turf.point(clean[i]), {units:'meters'});
+      state.sim.totalDistance += Number.isFinite(d) ? d : 0;
+      state.sim.cum.push(state.sim.totalDistance);
+    }
+    $('simProgress').value = 0;
+    updateLayer('sim-travelled', fc([]));
+    ensureMachineMarker();
+    if (clean.length) {
+      state.sim.marker.setLngLat(clean[0]);
+      state.sim.marker.getElement().style.display = 'flex';
+      setMachineBearing(0);
+    }
+    updateSimInfo();
+  }
+
+  function ensureMachineMarker() {
+    if (state.sim.marker) return;
+    const el = document.createElement('div');
+    el.className = 'machineMarker';
+    el.title = 'Simulated machine position';
+    state.sim.marker = new mapboxgl.Marker({element:el, rotationAlignment:'map'}).setLngLat(map.getCenter()).addTo(map);
+    el.style.display = 'none';
+  }
+
+  function startSimulation() {
+    if (!state.sim.path.length || state.sim.totalDistance <= 0) return setStatus('Generate trajectory first, then start simulation.');
+    ensureMachineMarker();
+    state.sim.playing = true;
+    state.sim.lastTs = null;
+    if (state.sim.distance >= state.sim.totalDistance) state.sim.distance = 0;
+    cancelAnimationFrame(state.sim.raf);
+    state.sim.raf = requestAnimationFrame(simStep);
+    updateSimInfo();
+  }
+
+  function pauseSimulation() {
+    state.sim.playing = false;
+    state.sim.lastTs = null;
+    cancelAnimationFrame(state.sim.raf);
+    updateSimInfo();
+  }
+
+  function stopSimulation(opts={}) {
+    state.sim.playing = false;
+    state.sim.lastTs = null;
+    state.sim.distance = 0;
+    cancelAnimationFrame(state.sim.raf);
+    if (opts.clearPath) {
+      state.sim.path = [];
+      state.sim.cum = [];
+      state.sim.totalDistance = 0;
+    }
+    if ($('simProgress')) $('simProgress').value = 0;
+    updateLayer('sim-travelled', fc([]));
+    if (state.sim.marker) {
+      if (state.sim.path.length && opts.keepMarker !== false) state.sim.marker.setLngLat(state.sim.path[0]);
+      if (opts.keepMarker === false) state.sim.marker.getElement().style.display = 'none';
+    }
+    updateSimInfo();
+  }
+
+  function simStep(ts) {
+    if (!state.sim.playing) return;
+    if (state.sim.lastTs === null) state.sim.lastTs = ts;
+    const dt = Math.min(0.1, (ts - state.sim.lastTs) / 1000);
+    state.sim.lastTs = ts;
+    const baseSpeed = Math.max(0.1, +$('machineSpeed').value || 1);
+    const playback = Math.max(0.1, +$('playbackSpeed').value || 1);
+    state.sim.distance += dt * baseSpeed * playback;
+    if (state.sim.distance >= state.sim.totalDistance) {
+      state.sim.distance = state.sim.totalDistance;
+      updateMachineAtDistance(state.sim.distance);
+      pauseSimulation();
+      return;
+    }
+    updateMachineAtDistance(state.sim.distance);
+    state.sim.raf = requestAnimationFrame(simStep);
+  }
+
+  function updateMachineAtDistance(dist) {
+    const pos = pointAtDistance(dist);
+    if (!pos) return;
+    ensureMachineMarker();
+    state.sim.marker.setLngLat(pos.coord);
+    state.sim.marker.getElement().style.display = 'flex';
+    setMachineBearing(pos.bearing);
+    $('simProgress').value = state.sim.totalDistance > 0 ? Math.round((dist / state.sim.totalDistance) * 1000) : 0;
+    updateTravelledPath(dist, pos.coord);
+    updateSimInfo();
+  }
+
+  function pointAtDistance(dist) {
+    const path = state.sim.path, cum = state.sim.cum;
+    if (!path.length) return null;
+    if (dist <= 0) return {coord:path[0], bearing:bearingBetween(path[0], path[1] || path[0])};
+    if (dist >= state.sim.totalDistance) return {coord:path[path.length-1], bearing:bearingBetween(path[path.length-2] || path[0], path[path.length-1])};
+    let lo=0, hi=cum.length-1;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (cum[mid] < dist) lo = mid + 1; else hi = mid;
+    }
+    const i = Math.max(1, lo);
+    const segStart = cum[i-1], segEnd = cum[i];
+    const f = segEnd > segStart ? (dist - segStart) / (segEnd - segStart) : 0;
+    const a = path[i-1], b = path[i];
+    return {coord:[a[0] + (b[0]-a[0]) * f, a[1] + (b[1]-a[1]) * f], bearing:bearingBetween(a,b)};
+  }
+
+  function updateTravelledPath(dist, currentCoord) {
+    const path = state.sim.path, cum = state.sim.cum;
+    if (!path.length) return;
+    const coords = [path[0]];
+    for (let i=1; i<path.length && cum[i] < dist; i++) coords.push(path[i]);
+    if (currentCoord) coords.push(currentCoord);
+    updateLayer('sim-travelled', coords.length > 1 ? fc([line(coords, {type:'simulated_travelled_path'})]) : fc([]));
+  }
+
+  function onProgressInput() {
+    if (!state.sim.path.length || state.sim.totalDistance <= 0) return;
+    const f = (+$('simProgress').value || 0) / 1000;
+    state.sim.distance = f * state.sim.totalDistance;
+    updateMachineAtDistance(state.sim.distance);
+  }
+
+  function updateSimInfo() {
+    const el = $('simInfo');
+    if (!el) return;
+    if (!state.sim.path.length || state.sim.totalDistance <= 0) {
+      el.textContent = 'Generate trajectory first, then press Play.';
+      return;
+    }
+    const baseSpeed = Math.max(0.1, +$('machineSpeed').value || 1);
+    const playback = Math.max(0.1, +$('playbackSpeed').value || 1);
+    const dist = Math.min(state.sim.distance, state.sim.totalDistance);
+    const remainSec = Math.max(0, (state.sim.totalDistance - dist) / (baseSpeed * playback));
+    el.textContent = `${state.sim.playing ? 'Playing' : 'Paused'} | ${dist.toFixed(1)} / ${state.sim.totalDistance.toFixed(1)} m | effective ${(baseSpeed*playback).toFixed(1)} m/s | remaining ${formatTime(remainSec)}`;
+  }
+
+  function setMachineBearing(bearing) {
+    if (!state.sim.marker) return;
+    if (typeof state.sim.marker.setRotation === 'function') state.sim.marker.setRotation(bearing);
+  }
+
+  function bearingBetween(a,b) {
+    if (!a || !b) return 0;
+    const y = Math.sin((b[0]-a[0]) * Math.PI/180) * Math.cos(b[1] * Math.PI/180);
+    const x = Math.cos(a[1] * Math.PI/180) * Math.sin(b[1] * Math.PI/180) - Math.sin(a[1] * Math.PI/180) * Math.cos(b[1] * Math.PI/180) * Math.cos((b[0]-a[0]) * Math.PI/180);
+    return (Math.atan2(y,x) * 180/Math.PI + 360) % 360;
+  }
+
+  function formatTime(sec) {
+    const s = Math.round(sec);
+    const m = Math.floor(s/60), r = s%60;
+    return `${m}:${String(r).padStart(2,'0')}`;
+  }
+
+  function exportGeojson() {
+    if (!state.lastGeojson) return setStatus('Generate trajectory first, then export.');
+    const blob = new Blob([JSON.stringify(state.lastGeojson, null, 2)], {type:'application/geo+json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'rotavation_trajectory.geojson'; a.click();
+    URL.revokeObjectURL(url);
+  }
+</script>
+</body>
+</html>
